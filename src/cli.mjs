@@ -633,7 +633,7 @@ async function runTunnel(args) {
   }
 
   try {
-    await waitForPublicRelay(infoUrl.publicUrl, { timeoutMs: 20000 });
+    await waitForPublicRelay(infoUrl.publicUrl);
   } catch (err) {
     warn(`tunnel URL not yet reachable: ${err.message} (continuing anyway)`);
   }
@@ -665,14 +665,18 @@ async function probeRelayHealth(port) {
  * The tunnel can print its URL before it can actually carry websocket upgrades.
  * Poll the public /health endpoint until it answers (or we give up), so the
  * bridge's first connection doesn't hit a 1006 and have to retry.
+ *
+ * Quick tunnels can take a while for DNS + the Cloudflare edge to propagate, so
+ * the default budget is generous; failing this is not fatal (the connector
+ * reconnects on its own), it just means we couldn't pre-warm.
  */
-async function waitForPublicRelay(publicUrl, { timeoutMs = 20000 } = {}) {
+async function waitForPublicRelay(publicUrl, { timeoutMs = 45000 } = {}) {
   const deadline = Date.now() + timeoutMs;
   let lastErr = "";
   while (Date.now() < deadline) {
     try {
       const res = await fetch(`${publicUrl.replace(/\/+$/, "")}/health`, {
-        signal: AbortSignal.timeout(4000),
+        signal: AbortSignal.timeout(5000),
       });
       if (res.ok) {
         const body = await res.json().catch(() => null);
@@ -682,7 +686,7 @@ async function waitForPublicRelay(publicUrl, { timeoutMs = 20000 } = {}) {
     } catch (err) {
       lastErr = err.message;
     }
-    await new Promise((r) => setTimeout(r, 500));
+    await new Promise((r) => setTimeout(r, 700));
   }
   throw new Error(`tunnel did not become reachable within ${timeoutMs}ms (${lastErr})`);
 }
@@ -742,7 +746,13 @@ async function runUp(args) {
         // carry WebSocket upgrades; connecting too early yields a 1006 blip.
         // Poll the public /health until it answers through the tunnel.
         console.log(c.dim("  waiting for the tunnel to be reachable…"));
-        await waitForPublicRelay(infoUrl.publicUrl, { timeoutMs: 20000 });
+        try {
+          await waitForPublicRelay(infoUrl.publicUrl);
+        } catch (err) {
+          // Not fatal: the connector keeps retrying and usually connects a few
+          // seconds later once DNS/edge propagation finishes.
+          warn(`tunnel not reachable yet (${err.message}); the bridge will keep retrying.`);
+        }
         console.log(`\n${c.green("●")} public URL: ${c.bold(infoUrl.publicUrl)}`);
         console.log(`${c.green("●")} your peer joins with: ${c.bold(infoUrl.wsUrl)}`);
         console.log(c.dim("  + the same passphrase you set on this machine\n"));
