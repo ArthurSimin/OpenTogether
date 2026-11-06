@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { createRelay } from "../src/relay.mjs";
 import { Connector } from "../src/connector.mjs";
-import { AgentBridge, parseFinalDeclaration } from "../src/bridge.mjs";
+import { AgentBridge, parseFinalDeclaration, stripFinalMarker } from "../src/bridge.mjs";
 import { OpenCodeClient } from "../src/opencode-client.mjs";
 import { createMockOpencode } from "./mock-opencode.mjs";
 
@@ -52,6 +52,14 @@ async function main() {
     const c = parseFinalDeclaration("[[OT:BEGIN kind=FINAL]]");
     assert.ok(c && c.done && c.summary === "", "bare FINAL with no summary");
     console.log("   ✓ parseFinalDeclaration handles FINAL marker variants");
+
+    // A reply that both answers AND declares done must keep the answer: the
+    // peer is waiting for it, and swallowing it silently loses the work.
+    const mixed = "The fix is to use node 20.\n[[OT:BEGIN kind=FINAL]]fixed[[OT:END]]";
+    assert.equal(stripFinalMarker(mixed), "The fix is to use node 20.");
+    assert.equal(stripFinalMarker("[[OT:BEGIN kind=FINAL]]only summary[[OT:END]]"), "");
+    assert.equal(stripFinalMarker("plain answer"), "plain answer");
+    console.log("   ✓ stripFinalMarker keeps the answer that precedes a FINAL");
   }
 
   const relay = createRelay({ port: 0, hostname: "127.0.0.1" });

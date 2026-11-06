@@ -137,6 +137,8 @@ ${c.bold("OPTIONS")}
   --passphrase <text>  shared secret (or OPENTOGETHER_PASSPHRASE)
   --opencode <url>     OpenCode server url (default http://127.0.0.1:4096)
   --dir <path>         project directory for OpenCode
+  --model <p/m>        model for the agent, e.g. omniroute/cw/claude-sonnet-5-5
+  --agent <name>       OpenCode agent to use (default: the session's own)
   --gui                open a live web dashboard
   --tui                open a full-screen terminal dashboard
   --tunnel             expose a local relay with a public cloudflared URL
@@ -266,6 +268,77 @@ async function runSetup(args, { fromUp = false } = {}) {
 
 // ---------------------------------------------------------------- connect
 
+/**
+ * Parse a --model value into the {providerID, modelID} shape OpenCode wants.
+ * Accepts "provider/model" (model ids may contain slashes, e.g.
+ * "omniroute/cw/claude-sonnet-5-5") or a bare model id.
+ */
+function parseModelFlag(value) {
+  if (!value) return undefined;
+  const str = String(value).trim();
+  if (!str) return undefined;
+  const slash = str.indexOf("/");
+  if (slash <= 0) return { modelID: str };
+  return { providerID: str.slice(0, slash), modelID: str.slice(slash + 1) };
+}
+
+/**
+ * Minimal "join a session" prompts: only what's missing. Used when a relay URL
+ * was passed on the command line but the shared passphrase/name aren't known
+ * yet, so joining a friend's tunnel is one command.
+ *
+ * @returns {Promise<boolean>} true if we're good to connect
+ */
+async function runJoinPrompts(config, { roleFromCli = false, roomFromCli = false } = {}) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q, def) =>
+    new Promise((resolve) => {
+      rl.question(`${q}${def ? c.dim(` [${def}]`) : ""}: `, (a) => resolve(a.trim() || def || ""));
+    });
+
+  console.log(c.bold("\nJoining a session.\n"));
+  console.log(c.dim(`  relay: ${config.relayUrl}\n`));
+
+  if (!config.passphrase) {
+    config.passphrase = await ask("Shared passphrase (from your friend)");
+    const passErr = validatePassphrase(config.passphrase);
+    if (passErr) {
+      error(passErr);
+      rl.close();
+      process.exitCode = 1;
+      return false;
+    }
+  }
+  if (!config.name) config.name = await ask("Your name");
+  if (!config.name) {
+    error("a name is required so your peer knows who they're talking to.");
+    rl.close();
+    process.exitCode = 1;
+    return false;
+  }
+  // Only ask about the room when it wasn't given on the command line. Joining
+  // requires an exact room match, so don't silently assume the default.
+  if (!roomFromCli) {
+    config.room = await ask("Room name (must match your friend's)", config.room || "default");
+  }
+
+  // Someone joining a relay is the guest by default. Don't silently inherit the
+  // "host" default from defaultConfig(), or both sides would claim to be host.
+  if (!roleFromCli && (config.role === "host" || !config.role)) {
+    const role = await ask("Your role (host/guest)", "guest");
+    config.role = role === "host" ? "host" : "guest";
+  }
+
+  rl.close();
+  try {
+    const file = saveConfig(config);
+    console.log(`${c.green("saved")} ${c.dim(file)}\n`);
+  } catch (err) {
+    warn(`could not save config: ${err.message}`);
+  }
+  return true;
+}
+
 async function runConnect(args, { chat, guiOnly = false }) {
   const { config: stored, exists } = loadConfig();
   const cli = {
@@ -279,16 +352,29 @@ async function runConnect(args, { chat, guiOnly = false }) {
     autoRespond: args["no-auto-respond"] ? false : undefined,
     forwardLocalUserMessages: args.forward ? true : undefined,
     agent: args.agent,
+    model: parseModelFlag(args.model),
   };
   const config = { ...stored };
   for (const [k, v] of Object.entries(cli)) if (v !== undefined) config[k] = v;
 
-  if (!config.relayUrl || !config.passphrase || !config.name) {
+  if (!config.relayUrl) {
     error("missing configuration. Run `opentogether setup` first, or pass --relay/--passphrase/--name.");
     if (!exists) info(`no config file at ${configPath()}`);
     process.exitCode = 1;
     return;
   }
+
+  // A relay URL was supplied but we still need the shared secret + identity.
+  // This is the "join a friend's session" path: ask just those, then save, so
+  // `opentogether gui --relay wss://.../ot` is a genuine one-command join.
+  if (!config.passphrase || !config.name) {
+    const joined = await runJoinPrompts(config, {
+      roleFromCli: args.role !== undefined,
+      roomFromCli: args.room !== undefined,
+    });
+    if (!joined) return;
+  }
+
   const passErr = validatePassphrase(config.passphrase);
   if (passErr) {
     error(passErr);

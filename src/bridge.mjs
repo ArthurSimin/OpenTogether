@@ -60,6 +60,38 @@ export function isAckOnly(text) {
   return /^\s*\[\[OT:BEGIN\s+kind=ACK/i.test(text.trim());
 }
 
+/**
+ * Remove the [[OT:BEGIN kind=FINAL]] ... [[OT:END]] block from a reply, leaving
+ * whatever real answer the agent wrote. Used so declaring done doesn't discard
+ * the message the peer was waiting for.
+ */
+export function stripFinalMarker(text) {
+  if (typeof text !== "string") return "";
+  return text
+    .replace(/\[\[OT:BEGIN\s+kind=FINAL\]\][\s\S]*?(?:\[\[OT:END\]\]|$)/gi, "")
+    .replace(/\[\[OT:END\]\]/gi, "")
+    .trim();
+}
+
+/**
+ * Turn a cryptic provider/model failure into a hint a human can act on.
+ * Returns "" when we have nothing useful to add.
+ */
+export function modelErrorHint(error) {
+  const msg = String(error ?? "");
+  if (!msg) return "";
+  if (/api key has expired|invalid api key|unauthorized|401/i.test(msg)) {
+    return "hint: your agent's model rejected its API key. Pick a working model with `--model provider/model` (e.g. --model omniroute/cw/claude-sonnet-5-5).";
+  }
+  if (/model not found|unknown model|no such model/i.test(msg)) {
+    return "hint: that model doesn't exist on your server. Run `opentogether doctor` to list providers, then pass `--model provider/model`.";
+  }
+  if (/rate limit|quota|429/i.test(msg)) {
+    return "hint: rate-limited or out of quota. Try another provider with `--model provider/model`.";
+  }
+  return "";
+}
+
 export class AgentBridge extends EventEmitter {
   constructor({
     opencode, // OpenCodeClient
@@ -433,6 +465,14 @@ export class AgentBridge extends EventEmitter {
       return;
     }
 
+    // A "final" message is the peer's last word before it declares done. It is
+    // shown in full (it's usually the answer we were waiting for) but it must
+    // not wake our agent — the work is over.
+    if (kind === "final") {
+      this._announce(`🏁 ${peerName} (final): ${truncate(String(text ?? ""), 600)}`);
+      return;
+    }
+
     // Brake 0: the conversation is already finished. Escaped messages can still
     // be in flight when someone declares done; record them but stay silent.
     if (this.finished) {
@@ -591,10 +631,13 @@ export class AgentBridge extends EventEmitter {
 
       if (!reply) {
         this.log(`agent produced no reply${error ? ` (error: ${error})` : ""}`);
+        // Model/auth problems are the most common cause and are cryptic, so
+        // translate them into something the human can act on.
+        const hint = modelErrorHint(error);
         // Never leave the peer hanging: tell them what happened.
         this.connector.say(
           error
-            ? `⚠️ My agent could not answer: ${scrubSecrets(String(error)).slice(0, 500)}`
+            ? `⚠️ My agent could not answer: ${scrubSecrets(String(error)).slice(0, 300)}${hint ? `\n${hint}` : ""}`
             : `(my agent finished but had nothing to say about that)`,
           { kind: error ? "error" : "note", from: this.connector.name, inReplyTo: wireId },
         );
@@ -602,10 +645,26 @@ export class AgentBridge extends EventEmitter {
       }
 
       // Did the agent declare the job finished? That ends the conversation for
-      // both sides — we send the declaration instead of a normal reply.
+      // both sides. But the agent may have also written a real answer *before*
+      // the marker — that answer must still reach the peer, otherwise declaring
+      // done silently swallows the result of the work.
       const final = parseFinalDeclaration(reply);
       if (final) {
         this.log(`agent declared FINAL${final.summary ? `: ${final.summary.slice(0, 80)}` : ""}`);
+        const answer = stripFinalMarker(reply);
+        if (answer) {
+          this.stats.outbound++;
+          this.stats.lastOutboundAt = Date.now();
+          this._rememberReply(answer);
+          const id = this.connector.say(answer, {
+            kind: "final",
+            from: this.connector.name,
+            role: this.connector.role,
+            inReplyTo: wireId,
+            hops,
+          });
+          this.emit("outbound", { id, text: answer, to: peerName, hops });
+        }
         this.declareDone({ summary: final.summary, by: "agent" });
         return;
       }
