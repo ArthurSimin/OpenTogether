@@ -22,6 +22,7 @@ import {
   saveConfig,
   configPath,
   discoverOpencode,
+  readV2Password,
   relayUrlFromParts,
   defaultConfig,
 } from "./config.mjs";
@@ -136,6 +137,7 @@ ${c.bold("OPTIONS")}
   --role <host|guest>  who you are in the pair
   --passphrase <text>  shared secret (or OPENTOGETHER_PASSPHRASE)
   --opencode <url>     OpenCode server url (default http://127.0.0.1:4096)
+  --opencode-password <pw>  password for a v2 OpenCode server (Basic auth)
   --dir <path>         project directory for OpenCode
   --model <p/m>        model for the agent, e.g. omniroute/cw/claude-sonnet-5-5
   --agent <name>       OpenCode agent to use (default: the session's own)
@@ -250,8 +252,9 @@ async function runSetup(args, { fromUp = false } = {}) {
   console.log(c.dim("\nProbing for a running OpenCode server…"));
   const found = await discoverOpencode({ explicitUrl: config.opencodeUrl });
   if (found) {
-    info(`found OpenCode at ${found.url}`);
+    info(`found OpenCode at ${found.url} (${found.api ?? "v1"} API)`);
     config.opencodeUrl = found.url;
+    if (found.password) config.opencodePassword = found.password;
   } else {
     warn("no running OpenCode server found.");
     console.log(c.dim("  Start one with:  opencode serve --port 4096\n"));
@@ -349,6 +352,7 @@ async function runConnect(args, { chat, guiOnly = false }) {
     role: args.role,
     opencodeUrl: args.opencode,
     opencodeDirectory: args.dir,
+    opencodePassword: args["opencode-password"] ?? process.env.OPENCODE_SERVER_PASSWORD,
     autoRespond: args["no-auto-respond"] ? false : undefined,
     forwardLocalUserMessages: args.forward ? true : undefined,
     agent: args.agent,
@@ -385,22 +389,35 @@ async function runConnect(args, { chat, guiOnly = false }) {
   if (!args.quietBanner) banner();
   // Locate OpenCode.
   let ocUrl = config.opencodeUrl;
-  if (!(await probe(ocUrl, config.opencodeDirectory))) {
+  let ocPassword = config.opencodePassword || undefined;
+  if (!(await probe(ocUrl, config.opencodeDirectory, ocPassword))) {
     warn(`cannot reach OpenCode at ${ocUrl} — searching…`);
-    const found = await discoverOpencode({ directory: config.opencodeDirectory });
+    const found = await discoverOpencode({
+      directory: config.opencodeDirectory,
+      password: ocPassword,
+    });
     if (!found) {
       error("no OpenCode server found. Start one with:  opencode serve --port 4096");
       process.exitCode = 1;
       return;
     }
     ocUrl = found.url;
-    info(`using OpenCode at ${ocUrl}`);
+    if (found.password) ocPassword = found.password;
+    info(`using OpenCode at ${ocUrl}${found.api === "v2" ? " (v2 API)" : ""}`);
+    if (found.needsPassword) {
+      error(
+        "this OpenCode server needs a password. Re-run with --opencode-password <pw>, " +
+          "or set OPENCODE_SERVER_PASSWORD before starting `opencode serve`.",
+      );
+      process.exitCode = 1;
+      return;
+    }
   }
 
   const oc = new OpenCodeClient({
     serverUrl: ocUrl,
     directory: config.opencodeDirectory || undefined,
-    password: config.opencodePassword || undefined,
+    password: ocPassword,
   });
 
   let connector;
@@ -895,11 +912,38 @@ async function startChat({ bridge, connector, config }) {
   });
 }
 
-async function probe(url, directory) {
+/**
+ * Is an OpenCode server answering at this url? Handles both API generations:
+ * v1 answers /global/health with JSON, v2 answers /openapi.json with JSON (or
+ * 401 JSON when it wants a password).
+ */
+async function probe(url, directory, password) {
   try {
     const u = new URL("/global/health", url);
+    if (directory) u.searchParams.set("directory", directory);
     const res = await fetch(u, { signal: AbortSignal.timeout(1500) });
-    return res.ok;
+    if (res.ok) {
+      const body = await res.json().catch(() => null);
+      if (body && typeof body === "object" && (body.healthy || body.version)) return true;
+    }
+  } catch {
+    // try v2 below
+  }
+  try {
+    const pw = password || process.env.OPENCODE_SERVER_PASSWORD || readV2Password();
+    const headers = {};
+    if (pw) headers.authorization = "Basic " + Buffer.from(`opencode:${pw}`, "utf8").toString("base64");
+    const res = await fetch(new URL("/openapi.json", url).toString(), {
+      headers,
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!/json/i.test(res.headers.get("content-type") ?? "")) return false;
+    if (res.ok) {
+      const doc = await res.json().catch(() => null);
+      return !!(doc && (doc.openapi || doc.paths));
+    }
+    // A JSON 401 means a v2 server is there, we just lack the password.
+    return res.status === 401 || res.status === 403;
   } catch {
     return false;
   }
@@ -917,8 +961,12 @@ async function runStatus() {
   console.log(c.bold("config"));
   for (const [k, v] of Object.entries(safe)) console.log(`  ${c.dim(k.padEnd(24))} ${v ?? ""}`);
   console.log(`\n${c.bold("opencode")}`);
-  const found = await discoverOpencode({ explicitUrl: config.opencodeUrl, directory: config.opencodeDirectory });
-  if (found) console.log(`  ${c.green("●")} reachable at ${found.url}`);
+  const found = await discoverOpencode({
+    explicitUrl: config.opencodeUrl,
+    directory: config.opencodeDirectory,
+    password: config.opencodePassword || undefined,
+  });
+  if (found) console.log(`  ${c.green("●")} reachable at ${found.url} (${found.api ?? "v1"} API)`);
   else console.log(`  ${c.red("○")} not reachable — start it with: opencode serve --port 4096`);
 }
 
@@ -940,16 +988,41 @@ async function runDoctor() {
   add(/^wss?:\/\//.test(config.relayUrl ?? ""), "relay URL looks like ws:// or wss://", config.relayUrl ?? "");
 
   console.log(c.bold("\nopencode\n"));
-  const found = await discoverOpencode({ explicitUrl: config.opencodeUrl, directory: config.opencodeDirectory });
-  add(!!found, "OpenCode server reachable", found?.url ?? "start: opencode serve --port 4096");
+  const found = await discoverOpencode({
+    explicitUrl: config.opencodeUrl,
+    directory: config.opencodeDirectory,
+    password: config.opencodePassword || undefined,
+  });
+  add(
+    !!found,
+    "OpenCode server reachable",
+    found ? `${found.url} (${found.api ?? "v1"} API)` : "start: opencode serve --port 4096",
+  );
+  if (found?.needsPassword) {
+    add(
+      false,
+      "OpenCode password",
+      "this v2 server needs Basic auth — set OPENCODE_SERVER_PASSWORD or pass --opencode-password",
+    );
+  }
   if (found) {
-    const oc = new OpenCodeClient({ serverUrl: found.url, directory: config.opencodeDirectory || undefined });
+    const oc = new OpenCodeClient({
+      serverUrl: found.url,
+      directory: config.opencodeDirectory || undefined,
+      password: found.password || config.opencodePassword || undefined,
+    });
     try {
       const agents = await oc.agentNames();
       add(agents.length > 0, `agents available: ${agents.join(", ") || "none"}`);
       const providers = await oc.providers();
       const configured = providers.filter((p) => p.models.length);
       add(configured.length > 0, `model providers configured: ${configured.map((p) => p.id).join(", ") || "none"}`);
+      if (config.model?.providerID) {
+        const ok = providers.some(
+          (p) => p.id === config.model.providerID && p.models.includes(config.model.modelID),
+        );
+        add(ok, `configured model exists: ${config.model.providerID}/${config.model.modelID}`);
+      }
     } catch (e) {
       add(false, "OpenCode API responds", e.message);
     }

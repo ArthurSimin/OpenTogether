@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const all = ["relay.test.mjs", "e2e.test.mjs", "control.test.mjs", "loop.test.mjs", "done.test.mjs", "install.test.mjs", "real-opencode.test.mjs"];
+const all = ["relay.test.mjs", "e2e.test.mjs", "control.test.mjs", "loop.test.mjs", "done.test.mjs", "install.test.mjs", "v2.test.mjs", "real-opencode.test.mjs"];
 const filters = process.argv.slice(2);
 const suites = filters.length ? all.filter((f) => filters.some((x) => f.includes(x))) : all;
 
