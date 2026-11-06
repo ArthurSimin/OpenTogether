@@ -1,0 +1,29 @@
+{
+  "name": "opentogether",
+  "version": "1.1.0",
+  "description": "Bridge two OpenCode agents on two different machines so they can talk to each other and debug together.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "opentogether": "./bin/opentogether.mjs"
+  },
+  "exports": {
+    "./plugin": "./src/plugin.mjs"
+  },
+  "scripts": {
+    "start": "node bin/opentogether.mjs",
+    "install-self": "node bin/opentogether.mjs install",
+    "up": "node bin/opentogether.mjs up --tunnel --gui",
+    "test": "node test/run-tests.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin",
+    "src",
+    "install.sh",
+    "README.md",
+    "AGENTS.md"
+  ]
+}

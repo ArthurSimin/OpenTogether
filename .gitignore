@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+package-lock.json
+
+# local runtime state / secrets
+config.json
+control.json
+*.bak
+.env
+.env.*
+
+# logs & temp
+*.log
+.DS_Store
+Thumbs.db
+
+# editor
+.vscode/
+.idea/
+*.swp
